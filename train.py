@@ -28,7 +28,7 @@
 
 """PixelCNN++ example."""
 
-from functools import partial
+import functools
 import datetime
 
 from absl import app
@@ -38,6 +38,7 @@ from absl import logging
 from flax import jax_utils
 from flax import optim
 from flax.metrics import tensorboard
+import flax.nn
 from flax.training import checkpoints
 from flax.training import common_utils
 
@@ -46,7 +47,7 @@ from jax import random
 from jax import lax
 import jax.numpy as jnp
 
-import tensorflow as tf
+import tensorflow.compat.v2 as tf
 
 import input_pipeline
 import pixelcnn
@@ -104,35 +105,36 @@ flags.DEFINE_float(
           'during Polyak averaging.'))
 
 
-def get_summary_writers():
-  current_time = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-  log_dir = FLAGS.model_dir + '/log/' + current_time
-  train_log_dir = log_dir + '/train'
-  eval_log_dir = log_dir + '/eval'
-  train_summary_writer = tensorboard.SummaryWriter(train_log_dir)
-  eval_summary_writer = tensorboard.SummaryWriter(eval_log_dir)
-  return train_summary_writer, eval_summary_writer
+def create_model(prng_key, example_images, module):
+  with flax.nn.stochastic(jax.random.PRNGKey(0)):
+    _, initial_params = module.init(prng_key, example_images)
+    model = flax.nn.Model(module, initial_params)
+  return model
 
 
-def model(**kwargs):
-  return pixelcnn.PixelCNNPP(None, depth=FLAGS.n_resnet, features=FLAGS.n_feature, **kwargs)
+def create_optimizer(model, learning_rate):
+  optimizer_def = optim.Adam(
+      learning_rate=learning_rate, beta1=0.95, beta2=0.9995)
+  optimizer = optimizer_def.create(model)
+  return optimizer
 
 
 def neg_log_likelihood_loss(nn_out, images):
   # The log-likelihood in bits per pixel-channel
-  means, inv_scales, logit_weights = (pixelcnn.conditional_params_from_outputs(nn_out, images))
-  log_likelihoods = pixelcnn.logprob_from_conditional_params(images, means, inv_scales, logit_weights)
+  means, inv_scales, logit_weights = (
+      pixelcnn.conditional_params_from_outputs(nn_out, images))
+  log_likelihoods = pixelcnn.logprob_from_conditional_params(
+      images, means, inv_scales, logit_weights)
   return -jnp.mean(log_likelihoods) / (jnp.log(2) * jnp.prod(images.shape[-3:]))
 
 
-def train_step(optimizer, ema, batch, learning_rate_fn, dropout_rng=None):
+def train_step(optimizer, ema, batch, prng_key, learning_rate_fn):
   """Perform a single training step."""
-  def loss_fn(params):
+  def loss_fn(model):
     """loss function used for training."""
-    logits = model(dropout_p=FLAGS.dropout_rate).apply({'param': params},
-                                                       batch['image'],
-                                                       rngs={'dropout': dropout_rng})
-    return neg_log_likelihood_loss(logits, batch['image'])
+    with flax.nn.stochastic(prng_key):
+      nn_out = model(batch['image'], dropout_p=FLAGS.dropout_rate)
+    return neg_log_likelihood_loss(nn_out, batch['image'])
 
   lr = learning_rate_fn(optimizer.state.step)
   grad_fn = jax.value_and_grad(loss_fn)
@@ -144,16 +146,16 @@ def train_step(optimizer, ema, batch, learning_rate_fn, dropout_rng=None):
   ema_decay = FLAGS.polyak_decay
   ema = jax.tree_multimap(
       lambda ema, p: ema * ema_decay + (1 - ema_decay) * p,
-      ema, optimizer.target)
+      ema, optimizer.target.params)
 
   metrics = {'loss': lax.pmean(loss, 'batch'), 'learning_rate': lr}
   return optimizer, ema, metrics
 
 
-def eval_step(params, batch):
+def eval_step(model, batch):
   images = batch['image']
-  logits = model().apply({'param': params}, images, dropout_p=0)
-  return {'loss': lax.pmean(neg_log_likelihood_loss(logits, images), 'batch')}
+  nn_out = model(images, dropout_p=0)
+  return {'loss': lax.pmean(neg_log_likelihood_loss(nn_out, images), 'batch')}
 
 
 def load_and_shard_tf_batch(xs):
@@ -177,21 +179,28 @@ def save_checkpoint(optimizer, ema):
   checkpoints.save_checkpoint(FLAGS.model_dir, (optimizer, ema), step, keep=3)
 
 
-def train():
+def train(pcnn_module, model_dir, batch_size, init_batch_size, num_epochs,
+          learning_rate, decay_rate, run_seed=0):
   """Train model."""
-  batch_size = FLAGS.batch_size
-  n_devices = jax.device_count()
   if jax.host_count() > 1:
     raise ValueError('PixelCNN++ example should not be run on more than 1 host'
                      ' (for now)')
-  if batch_size % n_devices > 0:
+
+  current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+  log_dir = model_dir + '/log/' + current_time
+  train_log_dir = log_dir + '/train'
+  eval_log_dir = log_dir + '/eval'
+  train_summary_writer = tensorboard.SummaryWriter(train_log_dir)
+  eval_summary_writer = tensorboard.SummaryWriter(eval_log_dir)
+
+  rng = random.PRNGKey(run_seed)
+
+  if batch_size % jax.device_count() > 0:
     raise ValueError('Batch size must be divisible by the number of devices')
 
-  train_summary_writer, eval_summary_writer = get_summary_writers()
-
   # Load dataset
-  data_source = input_pipeline.DataSource(train_batch_size=batch_size, 
-                                          eval_batch_size=batch_size)
+  data_source = input_pipeline.DataSource(
+      train_batch_size=batch_size, eval_batch_size=batch_size)
   train_ds = data_source.train_ds
   eval_ds = data_source.eval_ds
 
@@ -203,58 +212,44 @@ def train():
   steps_per_epoch = data_source.TRAIN_IMAGES // batch_size
   steps_per_eval = data_source.EVAL_IMAGES // batch_size
   steps_per_checkpoint = steps_per_epoch * 10
-  num_steps = steps_per_epoch * FLAGS.num_epochs
+  num_steps = steps_per_epoch * num_epochs
+
+  base_learning_rate = learning_rate
 
   # Create the model using data-dependent initialization. Don't shard the init
   # batch.
-  assert FLAGS.init_batch_size <= batch_size
-  init_batch = next(train_iter)['image']._numpy()[:FLAGS.init_batch_size]
+  assert init_batch_size <= batch_size
+  init_batch = next(train_iter)['image']._numpy()[:init_batch_size]
+  model = create_model(rng, init_batch, pcnn_module)
+  ema = model.params
+  optimizer = create_optimizer(model, base_learning_rate)
+  del model  # don't keep a copy of the initial model
 
-  print('init batch', init_batch.shape)
-
-  rng = random.PRNGKey(FLAGS.rng)
-  rng, init_rng = random.split(rng)
-  rng, dropout_rng = random.split(rng)
-
-  initial_variables = model().initialized({
-      'param': init_rng,
-      'dropout': dropout_rng
-    }, init_batch).variables.param
-  optimizer_def = optim.Adam(learning_rate=FLAGS.learning_rate, 
-                             beta1=0.95,
-                             beta2=0.9995)
-  optimizer = optimizer_def.create(initial_variables)
-
-  optimizer, ema = restore_checkpoint(optimizer, initial_variables)
+  optimizer, ema = restore_checkpoint(optimizer, ema)
   step_offset = int(optimizer.state.step)
-
   optimizer, ema = jax_utils.replicate((optimizer, ema))
 
   # Learning rate schedule
-  learning_rate_fn = lambda step: FLAGS.learning_rate * FLAGS.lr_decay ** step
+  learning_rate_fn = lambda step: base_learning_rate * decay_rate ** step
 
   # pmap the train and eval functions
   p_train_step = jax.pmap(
-      partial(train_step, learning_rate_fn=learning_rate_fn),
+      functools.partial(train_step, learning_rate_fn=learning_rate_fn),
       axis_name='batch')
   p_eval_step = jax.pmap(eval_step, axis_name='batch')
 
   # Gather metrics
   train_metrics = []
-
   for step, batch in zip(range(step_offset, num_steps), train_iter):
-    print('step', step)
+    # Generate a PRNG key that will be rolled into the batch
+    rng, step_key = jax.random.split(rng)
     # Load and shard the TF batch
     batch = load_and_shard_tf_batch(batch)
-    print('batch loaded')
-
-    # Generate a PRNG key that will be rolled into the batch.
-    rng, step_rng = random.split(rng)
-    sharded_rngs = common_utils.shard_prng_key(step_rng)
+    # Shard the step PRNG key
+    sharded_keys = common_utils.shard_prng_key(step_key)
 
     # Train step
-    optimizer, ema, metrics = p_train_step(optimizer, ema, batch, 
-                                           dropout_rng=sharded_rngs)
+    optimizer, ema, metrics = p_train_step(optimizer, ema, batch, sharded_keys)
     train_metrics.append(metrics)
 
     if (step + 1) % steps_per_epoch == 0:
@@ -300,9 +295,13 @@ def main(argv):
   if len(argv) > 1:
     raise app.UsageError('Too many command-line arguments.')
 
-  # tf.executing_eagerly()
+  tf.enable_v2_behavior()
 
-  train()
+  pcnn_module = pixelcnn.PixelCNNPP.partial(depth=FLAGS.n_resnet,
+                                            features=FLAGS.n_feature)
+
+  train(pcnn_module, FLAGS.model_dir, FLAGS.batch_size, FLAGS.init_batch_size,
+        FLAGS.num_epochs, FLAGS.learning_rate, FLAGS.lr_decay, FLAGS.rng)
 
 
 if __name__ == '__main__':
