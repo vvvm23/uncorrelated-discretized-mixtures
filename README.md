@@ -1,3 +1,43 @@
+# Discretized Logistic Mixtures on Semantically Dissimilar and Proximal Values
+
+This repository contains my experimentation on whether discretized logistic
+mixtures can be applied to parameterised distributions over discrete values
+where discrete values that are close to one another may have entirely different
+semantics.
+
+For example, on image data we know that discrete value 128 is similar to 127 and
+129, and so are likely to have similar probabilities. The smoothness of the
+distribution is illustrated in Figure 1 of [PixelCNN++](https://arxiv.org/abs/1701.05517) 
+which means the model can simply predict the mixture of distributions, rather
+than an explicit N-way softmax. This leads to massive computational savings and
+faster convergence due to denser gradients.
+
+However, can this method be applied data where close values have entirely
+different semantics? For example, in an NLP task token 1234 and token 1235 may
+refer to `cat` and `热茶` respectively. Discrete latents 0 and 1 in a VQ-VAE
+codebook may map to vectors that are far away in the continuous latent space.
+
+My intuition says no, however I am unable to find much discussion of this
+elsewhere. If it were possible, it could massively reduce the dimensionality of
+the output, leading to a similar improvements in computational efficiency and
+convergence speed.
+
+So to confirm my suspicions, I propose a simple experiment:
+- Construct an injective mapping from pixel intensities to a random discrete
+  value in the same domain.
+- Take some image dataset, say CIFAR-10 or MNIST-style, and augment all
+  intensities using this random mapping. 
+- Proceed as in PixelCNN++ using this augmented dataset, except discarding
+  probability mass that falls outside the valid range of values as we no longer
+  should bias towards the extremities of the distribution.
+
+To speed things up, I've copied a flax implementation of PixelCNN++ as provided
+in the examples [here](https://github.com/google/flax/tree/master/examples/pixelcnn). 
+
+The rest of this README is precisely the contents of their original README.
+
+---
+
 ## PixelCNN++ image modelling
 Trains a PixelCNN++ model [(Salimans et al.,
 2017)](https://arxiv.org/abs/1701.05517) for image generation on the CIFAR-10 dataset.
